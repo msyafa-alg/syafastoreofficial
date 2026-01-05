@@ -12,7 +12,7 @@
     "axios": "^1.6.0",
     "crypto": "^1.0.1"
   },
-  "engines": {
-    "node": "18.x"
+"engines": {
+    "node": "24.x"
   }
 }
