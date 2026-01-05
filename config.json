@@ -2,7 +2,7 @@
   "atlanticApiKey": "QRyBR0QStOJzUvYTuSKEdR6zq8u2TrbmfHihuvfYFUC1CxYKZXpEU45T8ZMWMPwEdTeo8DK9sG7EgwJlwvgIXeC9WArSS7M9hYE8",
   "pterodactylApiKey": "ptlc_LUQutK707DOdB0lZtL4CDPOw4jCC754NJqRVebu2Egx",
   "pterodactylPanelUrl": "https://syafaprivate.syafapnl.biz.id",
-  "qrisCallbackUrl": "https://syafastoreofficial/api/webhook",
+"qrisCallbackUrl": "https://syafastoreofficial-maj2.vercel.app/api/webhook",
   "locationId": 1,
   "eggId": 15,
   "packages": [

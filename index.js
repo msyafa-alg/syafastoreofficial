@@ -1,7 +1,6 @@
 // index.js - Main Express application
 const express = require('express');
 const path = require('path');
-const fs = require('fs').promises;
 const crypto = require('crypto');
 const axios = require('axios');
 
@@ -12,24 +11,21 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Constants
-const ATLANTIC_API_URL = 'https://api.atlantic-payment.com/v1';
+const ATLANTIC_API_URL = 'https://atlantich2h.com';
 const PTERODACTYL_API_URL = 'https://panel.yourdomain.com/api'; // Change this
 const PORT = process.env.PORT || 3000;
 
 // File paths
-const ORDERS_FILE = path.join(process.cwd(), 'orders.json');
 const CONFIG_FILE = path.join(process.cwd(), 'config.json');
 
-// Initialize files if they don't exist
+// In-memory storage for Vercel compatibility
+const ordersStore = new Map();
+
+// Initialize config file if it doesn't exist
 async function initializeFiles() {
   try {
-    await fs.access(ORDERS_FILE);
-  } catch {
-    await fs.writeFile(ORDERS_FILE, JSON.stringify([], null, 2));
-  }
-  
-  try {
-    await fs.access(CONFIG_FILE);
+    const fs = require('fs');
+    await fs.promises.access(CONFIG_FILE);
   } catch {
     const defaultConfig = {
       atlanticApiKey: process.env.ATLANTIC_API_KEY || '',
@@ -46,32 +42,35 @@ async function initializeFiles() {
         { id: 5, name: '16GB Premium', ram: 16384, price: 165000 }
       ]
     };
-    await fs.writeFile(CONFIG_FILE, JSON.stringify(defaultConfig, null, 2));
+    const fs = require('fs');
+    await fs.promises.writeFile(CONFIG_FILE, JSON.stringify(defaultConfig, null, 2));
   }
 }
 
-// Order management
-async function saveOrder(order) {
-  const orders = JSON.parse(await fs.readFile(ORDERS_FILE, 'utf8'));
-  orders.push(order);
-  await fs.writeFile(ORDERS_FILE, JSON.stringify(orders, null, 2));
+// Order management - using in-memory storage for Vercel
+function saveOrder(order) {
+  ordersStore.set(order.reff_id, order);
   return order;
 }
 
-async function updateOrder(reffId, updates) {
-  const orders = JSON.parse(await fs.readFile(ORDERS_FILE, 'utf8'));
-  const orderIndex = orders.findIndex(o => o.reff_id === reffId);
+function updateOrder(reffId, updates) {
+  const existingOrder = ordersStore.get(reffId);
+  if (!existingOrder) return null;
   
-  if (orderIndex === -1) return null;
-  
-  orders[orderIndex] = { ...orders[orderIndex], ...updates };
-  await fs.writeFile(ORDERS_FILE, JSON.stringify(orders, null, 2));
-  return orders[orderIndex];
+  const updatedOrder = { ...existingOrder, ...updates };
+  ordersStore.set(reffId, updatedOrder);
+  return updatedOrder;
 }
 
-async function getOrder(reffId) {
-  const orders = JSON.parse(await fs.readFile(ORDERS_FILE, 'utf8'));
-  return orders.find(o => o.reff_id === reffId) || null;
+function getOrder(reffId) {
+  return ordersStore.get(reffId) || null;
+}
+
+// Load config helper
+async function loadConfig() {
+  const fs = require('fs');
+  const configData = await fs.promises.readFile(CONFIG_FILE, 'utf8');
+  return JSON.parse(configData);
 }
 
 // Generate unique reference ID
@@ -81,7 +80,7 @@ function generateReffId() {
 
 // Main routes
 app.get('/', async (req, res) => {
-  const config = JSON.parse(await fs.readFile(CONFIG_FILE, 'utf8'));
+  const config = await loadConfig();
   
   const html = `
   <!DOCTYPE html>
@@ -776,7 +775,7 @@ app.get('/', async (req, res) => {
 // API Routes
 app.get('/api/packages', async (req, res) => {
   try {
-    const config = JSON.parse(await fs.readFile(CONFIG_FILE, 'utf8'));
+    const config = await loadConfig();
     res.json(config.packages);
   } catch (error) {
     console.error('Error loading packages:', error);
@@ -789,7 +788,7 @@ app.post('/api/create-order', async (req, res) => {
     const { packageId, panelUsername, customerEmail } = req.body;
     
     // Load config and packages
-    const config = JSON.parse(await fs.readFile(CONFIG_FILE, 'utf8'));
+    const config = await loadConfig();
     const selectedPackage = config.packages.find(p => p.id === parseInt(packageId));
     
     if (!selectedPackage) {
@@ -819,30 +818,30 @@ app.post('/api/create-order', async (req, res) => {
       error_message: ''
     };
     
-    // Create Atlantic deposit
+    // Create Atlantic H2H deposit using form-urlencoded format
     const atlanticResponse = await axios.post(
       `${ATLANTIC_API_URL}/deposit/create`,
-      {
+      new URLSearchParams({
+        api_key: config.atlanticApiKey,
         reff_id: reffId,
-        amount: selectedPackage.price,
-        payment_method: 'qris',
-        customer_email: customerEmail || '',
-        callback_url: config.qrisCallbackUrl
-      },
+        nominal: selectedPackage.price.toString(),
+        type: 'ewallet',
+        method: 'qris'
+      }),
       {
         headers: {
-          'Authorization': `Bearer ${config.atlanticApiKey}`,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/x-www-form-urlencoded'
         }
       }
     );
     
-    if (atlanticResponse.data.status === 'success') {
-      order.qris_url = atlanticResponse.data.data.qris_url;
-      order.qris_content = atlanticResponse.data.data.qris_content;
-      order.atlantic_transaction_id = atlanticResponse.data.data.transaction_id;
+    if (atlanticResponse.data.status === true) {
+      // Use correct field names from Atlantic H2H API
+      order.qris_url = atlanticResponse.data.data.qr_image;
+      order.qris_content = atlanticResponse.data.data.qr_string;
+      order.atlantic_transaction_id = atlanticResponse.data.data.id;
       
-      await saveOrder(order);
+      saveOrder(order);
       
       res.json({
         success: true,
@@ -858,7 +857,7 @@ app.post('/api/create-order', async (req, res) => {
     console.error('Error creating order:', error);
     res.status(500).json({ 
       success: false, 
-      error: error.response?.data?.message || 'Failed to create order' 
+      error: error.response?.data?.message || error.message || 'Failed to create order' 
     });
   }
 });
@@ -915,7 +914,7 @@ app.post('/api/webhook', async (req, res) => {
     
     try {
       // Create Pterodactyl user
-      const config = JSON.parse(await fs.readFile(CONFIG_FILE, 'utf8'));
+      const config = await loadConfig();
       const password = crypto.randomBytes(8).toString('hex');
       
       const userResponse = await axios.post(
