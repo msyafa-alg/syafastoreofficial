@@ -78,6 +78,398 @@ function generateReffId() {
   return `WEB_SYAFA_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 }
 
+// ===========================================
+// Atlantic H2H API Helper Functions
+// ===========================================
+
+/**
+ * Check deposit status using Atlantic H2H API
+ * POST /deposit/status with application/x-www-form-urlencoded
+ */
+async function checkAtlanticDepositStatus(apiKey, depositId) {
+  try {
+    const response = await axios.post(
+      `${ATLANTIC_API_URL}/deposit/status`,
+      new URLSearchParams({
+        api_key: apiKey,
+        id: depositId
+      }).toString(),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      }
+    );
+    return {
+      success: true,
+      data: response.data
+    };
+  } catch (error) {
+    console.error('Error checking Atlantic deposit status:', error.message);
+    return {
+      success: false,
+      error: error.response?.data?.message || error.message || 'Failed to check deposit status',
+      status: error.response?.status || 500
+    };
+  }
+}
+
+/**
+ * Create deposit using Atlantic H2H API
+ * POST /deposit/create with application/x-www-form-urlencoded
+ */
+async function createAtlanticDeposit(apiKey, reffId, nominal, method = 'qris') {
+  try {
+    const response = await axios.post(
+      `${ATLANTIC_API_URL}/deposit/create`,
+      new URLSearchParams({
+        api_key: apiKey,
+        reff_id: reffId,
+        nominal: nominal.toString(),
+        type: 'ewallet',
+        method: method
+      }).toString(),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      }
+    );
+    return {
+      success: true,
+      data: response.data
+    };
+  } catch (error) {
+    console.error('Error creating Atlantic deposit:', error.message);
+    return {
+      success: false,
+      error: error.response?.data?.message || error.message || 'Failed to create deposit',
+      status: error.response?.status || 500
+    };
+  }
+}
+
+// ===========================================
+// API Endpoints
+// ===========================================
+
+/**
+ * POST /api/check-deposit
+ * Check deposit status using Atlantic H2H /deposit/status endpoint
+ * Body: { reff_id: string }
+ */
+app.post('/api/check-deposit', async (req, res) => {
+  try {
+    const { reff_id } = req.body;
+    
+    if (!reff_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing reff_id parameter'
+      });
+    }
+    
+    // Find the order
+    const order = getOrder(reff_id);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found'
+      });
+    }
+    
+    // Load config for API key
+    const config = await loadConfig();
+    
+    // Check deposit status using Atlantic API
+    const atlanticResult = await checkAtlanticDepositStatus(
+      config.atlanticApiKey,
+      order.atlantic_transaction_id
+    );
+    
+    if (!atlanticResult.success) {
+      return res.status(atlanticResult.status || 500).json({
+        success: false,
+        error: atlanticResult.error
+      });
+    }
+    
+    const atlanticData = atlanticResult.data;
+    
+    // Map Atlantic status to our status
+    let newStatus = order.status;
+    let depositData = {};
+    
+    if (atlanticData.status === true && atlanticData.data) {
+      const depositInfo = atlanticData.data;
+      
+      // Update order with deposit info
+      depositData = {
+        nominal: depositInfo.nominal,
+        fee: depositInfo.fee,
+        get_balance: depositInfo.get_balance,
+        metode: depositInfo.metode,
+        status: mapAtlanticStatus(depositInfo.status),
+        updated_at: new Date().toISOString()
+      };
+      
+      newStatus = depositData.status;
+    }
+    
+    // Update order if status changed
+    if (newStatus !== order.status) {
+      updateOrder(reffId, depositData);
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        order_status: newStatus,
+        deposit: atlanticData.data || null
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error in /api/check-deposit:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error'
+    });
+  }
+});
+
+/**
+ * POST /api/process-deposit
+ * Check deposit status and process server creation if payment successful
+ * Body: { reff_id: string }
+ */
+app.post('/api/process-deposit', async (req, res) => {
+  try {
+    const { reff_id } = req.body;
+    
+    if (!reff_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing reff_id parameter'
+      });
+    }
+    
+    // Find the order
+    const order = getOrder(reff_id);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found'
+      });
+    }
+    
+    // Skip if already processed
+    if (order.status === 'success' || order.status === 'failed') {
+      return res.json({
+        success: true,
+        data: {
+          order_status: order.status,
+          already_processed: true
+        }
+      });
+    }
+    
+    // Load config
+    const config = await loadConfig();
+    
+    // Check deposit status
+    const atlanticResult = await checkAtlanticDepositStatus(
+      config.atlanticApiKey,
+      order.atlantic_transaction_id
+    );
+    
+    if (!atlanticResult.success) {
+      return res.status(500).json({
+        success: false,
+        error: atlanticResult.error
+      });
+    }
+    
+    const atlanticData = atlanticResult.data;
+    
+    // Check if payment successful
+    if (atlanticData.status !== true || !atlanticData.data) {
+      return res.json({
+        success: true,
+        data: {
+          order_status: order.status,
+          payment_received: false
+        }
+      });
+    }
+    
+    const depositInfo = atlanticData.data;
+    const mappedStatus = mapAtlanticStatus(depositInfo.status);
+    
+    // If not success status, return current status
+    if (mappedStatus !== 'success') {
+      updateOrder(reff_id, {
+        status: mappedStatus,
+        updated_at: new Date().toISOString()
+      });
+      
+      return res.json({
+        success: true,
+        data: {
+          order_status: mappedStatus,
+          payment_received: false
+        }
+      });
+    }
+    
+    // Payment successful - process server creation
+    updateOrder(reff_id, {
+      status: 'processing',
+      nominal: depositInfo.nominal,
+      fee: depositInfo.fee,
+      get_balance: depositInfo.get_balance,
+      metode: depositInfo.metode,
+      updated_at: new Date().toISOString()
+    });
+    
+    // Create Pterodactyl user and server
+    try {
+      const password = crypto.randomBytes(8).toString('hex');
+      
+      // Create user
+      const userResponse = await axios.post(
+        `${PTERODACTYL_API_URL}/application/users`,
+        {
+          username: order.panel_username,
+          email: order.customer_email || `${order.panel_username}@web-syafa-store.com`,
+          first_name: order.panel_username,
+          last_name: 'Customer',
+          password: password
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${config.pterodactylApiKey}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          }
+        }
+      );
+      
+      const userId = userResponse.data.attributes.id;
+      
+      // Create server
+      const serverResponse = await axios.post(
+        `${PTERODACTYL_API_URL}/application/servers`,
+        {
+          name: `${order.panel_username}-${order.package_name}`,
+          user: userId,
+          egg: config.eggId,
+          docker_image: 'ghcr.io/pterodactyl/yolks:nodejs_24',
+          startup: 'if [[ -d .git ]] && [[ {{AUTO_UPDATE}} != "0" ]]; then git pull; fi; if [[ ! -z {{NODE_PACKAGES}} ]]; then /usr/local/bin/npm install {{NODE_PACKAGES}}; fi; if [[ ! -z {{NODE_PACKAGES}} ]]; then /usr/local/bin/npm install {{NODE_PACKAGES}}; fi; /usr/local/bin/node {{NODE_JS_FILE}}',
+          environment: {
+            AUTO_UPDATE: '0',
+            NODE_PACKAGES: '',
+            NODE_JS_FILE: 'index.js'
+          },
+          limits: {
+            memory: order.ram,
+            swap: 0,
+            disk: order.disk,
+            io: 500,
+            cpu: order.cpu * 100
+          },
+          feature_limits: {
+            databases: 5,
+            backups: 2,
+            allocations: 1
+          },
+          allocation: {
+            default: config.locationId
+          },
+          deploy: {
+            locations: [config.locationId],
+            dedicated_ip: false,
+            port_range: []
+          }
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${config.pterodactylApiKey}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          }
+        }
+      );
+      
+      // Update order with success details
+      updateOrder(reff_id, {
+        status: 'success',
+        panel_domain: config.pterodactylPanelUrl,
+        panel_password: password,
+        user_id: userId,
+        server_id: serverResponse.data.attributes.id,
+        updated_at: new Date().toISOString()
+      });
+      
+      res.json({
+        success: true,
+        data: {
+          order_status: 'success',
+          payment_received: true,
+          server_created: true,
+          panel_domain: config.pterodactylPanelUrl,
+          panel_username: order.panel_username,
+          panel_password: password
+        }
+      });
+      
+    } catch (panelError) {
+      console.error('Pterodactyl error:', panelError);
+      
+      // Update order with failure
+      updateOrder(reff_id, {
+        status: 'failed',
+        error_message: panelError.response?.data?.errors?.[0]?.detail || 'Failed to create server',
+        updated_at: new Date().toISOString()
+      });
+      
+      res.status(500).json({
+        success: false,
+        error: 'Server creation failed',
+        details: panelError.response?.data?.errors?.[0]?.detail || panelError.message
+      });
+    }
+    
+  } catch (error) {
+    console.error('Error in /api/process-deposit:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error'
+    });
+  }
+});
+
+/**
+ * Map Atlantic H2H status to our status
+ */
+function mapAtlanticStatus(atlanticStatus) {
+  const statusMap = {
+    'success': 'success',
+    'Sukses': 'success',
+    'pending': 'pending',
+    'Pending': 'pending',
+    'processing': 'processing',
+    'Processing': 'processing',
+    'expired': 'expired',
+    'Expired': 'expired',
+    'failed': 'failed',
+    'Failed': 'failed',
+    'gagal': 'failed'
+  };
+  
+  return statusMap[atlanticStatus] || 'pending';
+}
+
 // Main routes
 app.get('/', async (req, res) => {
   const config = await loadConfig();
@@ -944,7 +1336,7 @@ app.post('/api/webhook', async (req, res) => {
           name: `${existingOrder.panel_username}-${existingOrder.package_name}`,
           user: userId,
           egg: config.eggId,
-          docker_image: 'ghcr.io/pterodactyl/yolks:nodejs_18',
+          docker_image: 'ghcr.io/pterodactyl/yolks:nodejs_24',
           startup: 'if [[ -d .git ]] && [[ {{AUTO_UPDATE}} != "0" ]]; then git pull; fi; if [[ ! -z {{NODE_PACKAGES}} ]]; then /usr/local/bin/npm install {{NODE_PACKAGES}}; fi; if [[ ! -z {{NODE_PACKAGES}} ]]; then /usr/local/bin/npm install {{NODE_PACKAGES}}; fi; /usr/local/bin/node {{NODE_JS_FILE}}',
           environment: {
             AUTO_UPDATE: '0',
